@@ -64,3 +64,11 @@ stop-gateway.bat
 /cmd/desktopverify*/
 *.zip
 server.exe
+
+# macOS 杂物（含子目录：assets/ cmd/ internal/ 里都会冒出来）
+.DS_Store
+**/.DS_Store
+
+# Go 构建缓存（本地跑 go build -o / go test 时若设了 GOCACHE 就会落在仓库里，
+# 实测有 200MB+，绝不能入库）
+.gocache/
