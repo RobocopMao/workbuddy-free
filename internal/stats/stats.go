@@ -48,9 +48,25 @@ type Bucket struct {
 	Failed       int64 `json:"failed,omitempty"`
 	LatencyMsSum int64 `json:"latency_ms_sum,omitempty"`
 	LatencyCount int64 `json:"latency_count,omitempty"`
+
+	// Credits / CreditsTotal 是**采样时刻所有账号的余额合计**：剩余 / 总额（见
+	// AddCredits）。它们与上面那些字段性质不同——流量回答"这一天烧了多少"（累计量，
+	// 合并即相加），余额回答"这一天最后一次看到时还剩多少"（水位，只能覆盖）。
+	// 因此 Merge 刻意不碰这两个字段：把两个桶的余额加起来是毫无意义的倍数。
+	//
+	// 用指针而不是 int64+omitempty 是必须的：「这一格没采到余额」与「这一格余额
+	// 真的是 0」在曲线上是两件完全不同的事（前者该是空档，后者是掉到地板）。
+	// int64 的 0 会被 omitempty 吞掉键，前端只能解成 nil，两种情况就再也分不开。
+	//
+	// 用 int64 而非 float64：积分在本项目里自始至终是整数（upstream 解析、
+	// pool.entry.credits、面板响应都是 int64），JSON 里同样是 number，
+	// 但没有 float64 的精度与科学计数法隐患。
+	Credits      *int64 `json:"credits,omitempty"`
+	CreditsTotal *int64 `json:"credits_total,omitempty"`
 }
 
-// Merge 把 o 累加进 b。
+// Merge 把 o 累加进 b。**不合并 Credits/CreditsTotal**：它们是水位不是累计量，
+// 细节见 Bucket 里那两个字段的注释。合并后的桶保留 b 自己的余额（若有）。
 func (b *Bucket) Merge(o Bucket) {
 	b.PromptTokens += o.PromptTokens
 	b.CompletionTokens += o.CompletionTokens
@@ -62,6 +78,19 @@ func (b *Bucket) Merge(o Bucket) {
 	b.LatencyCount += o.LatencyCount
 }
 
+// creditAccount 一个账号的最后一次余额观测。
+type creditAccount struct {
+	Remaining int64 `json:"remaining"`
+	Total     int64 `json:"total"`
+	// AtUnix 秒级时间戳。用整数而不是 RFC3339 字符串：这里只用来算"馊了没有"，
+	// 存字符串就得多一条解析失败的分支，而解析失败该怎么处理没有正确答案。
+	AtUnix int64 `json:"at_unix"`
+}
+
+// creditSampleTTL 是"最后已知余额"的保质期。超过它没再采到的账号会被从合计里剔除，
+// 好让删除账号 / 长期不用的账号自动退出，不至于永远虚增曲线。
+const creditSampleTTL = 7 * 24 * time.Hour
+
 // dayStat 单个自然日的聚合：三个切面（模型/账号/小时）各一张桶表 + 当日总计。
 // 三个切面互为独立维度，各自求和都等于 Total（记录时四者同步累加，不重不漏）。
 type dayStat struct {
@@ -70,7 +99,7 @@ type dayStat struct {
 	// ByHour 当日 24 个小时桶（键 "00".."23"）。今日视图按小时出图，
 	// 才能看出"这一天是什么时候烧的"——按天只有一个柱子，没有信息量。
 	ByHour map[string]*Bucket `json:"by_hour,omitempty"`
-	Total  Bucket              `json:"total"`
+	Total  Bucket             `json:"total"`
 }
 
 // Sample 一次聊天尝试的统计样本。
@@ -104,6 +133,11 @@ type Recorder struct {
 	uids  map[string]struct{}
 	since string
 
+	// credits 每个账号的最后一次余额观测（见 AddCredits）。与 days 分开存：
+	// 合计要跨账号求和、且和"今天"无关（7 天保质期内都算数），塞进某个日桶里
+	// 会随时间轴漂移。同为观测数据，跟着 stats.json 一起落盘。
+	credits map[string]creditAccount
+
 	fp       string
 	keepDays int
 
@@ -122,6 +156,7 @@ func New(fp string, keepDays int) *Recorder {
 	r := &Recorder{
 		days:     map[string]*dayStat{},
 		uids:     map[string]struct{}{},
+		credits:  map[string]creditAccount{},
 		fp:       fp,
 		keepDays: keepDays,
 		stopCh:   make(chan struct{}),
@@ -238,6 +273,108 @@ func (r *Recorder) pruneLocked(now time.Time) {
 			r.dirty.Store(true)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 积分（余额）采样
+// ---------------------------------------------------------------------------
+
+// AddCredits 记下一次**余额观测**：某账号当前剩余 / 总额（workbuddy 口径下 credits
+// 就是剩余积分，total 是总额；顺序不能反）。
+//
+// 与 Record（请求流量）分开的原因：余额是水位、按覆盖写，流量是累计、按加法写。
+// 混在一个方法里迟早有人把余额也 += 上去。
+//
+// 采样频率决定了曲线的分辨率：调用方是余额刷新（后台周期 + 面板手动触发），
+// 同一小时桶会被覆盖多次，日桶留的是"当天最后一次"。
+// **代价是当天中途的历史水位会被覆盖**：如果 09:00 剩 500、10:00 签到后剩 600、
+// 11:00 消耗到 550，那么"10:00"这一格最终留的是 550 而不是 600 ——
+// 天粒度下看不到"签到那一刻的台阶"。这是刻意的取舍：真按每次采样都追加，
+// 30 天 × 288 次/天 的点数对一条 30 格曲线毫无意义，而"每天结束时的余额"
+// 才是这条曲线要回答的问题。
+func (r *Recorder) AddCredits(accountID string, remaining, total int64) {
+	r.addCreditsAt(accountID, remaining, total, r.now())
+}
+
+// addCreditsAt 以 now 归日归时（同 recordAt 的拆法，便于单测固定时钟）。
+func (r *Recorder) addCreditsAt(accountID string, remaining, total int64, now time.Time) {
+	// 空 uid 会把所有取不到账号标识的观测混成一个假账号，宁可丢掉这一次采样
+	// （流量侧对空 uid 的处理是跳过切面，这里没有"总计"可退，只能整体丢弃）。
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// New 已初始化，但 load 读到的老文件没有这个键（nil），这里再兜一次：
+	// 本包的 Recorder 是零值不可用 + 必须经 New 构造，两处都守住才不会写崩。
+	if r.credits == nil {
+		r.credits = map[string]creditAccount{}
+	}
+	// 覆盖写：同一账号只留最后一次观测，绝不累加。
+	r.credits[accountID] = creditAccount{Remaining: remaining, Total: total, AtUnix: now.Unix()}
+	sum, sumTotal := r.creditSumLocked(now)
+	r.setCreditsLocked(now, sum, sumTotal)
+	// 也要修剪：只跑余额采样、这段时间没有任何请求时 Record 从不被调用，
+	// 天桶就会绕过 keepDays 无界增长（闲置的服务恰恰是这种形态）。
+	r.pruneLocked(now)
+	// 落盘交给既有的 dirty/flusher 机制（5s 一跳），不在这里同步写文件：
+	// 余额采样是分钟级的高频动作，每次都 fsync 一遍 stats.json 得不偿失，
+	// 而统计本身允许"最多丢最后 5 秒"。
+	r.dirty.Store(true)
+}
+
+// creditSumLocked 把所有**未过期**账号的最后已知余额相加，顺手删掉过期的。
+//
+// 过期的账号按"已删除"处理：保留它的旧值会让曲线在账号早已停用后仍然虚高一段
+// （且永远不会回落，因为没人再更新它）。
+//
+// 在求和时删除而不是另起一个清理函数：这个函数是**唯一**读这张表的地方，
+// 判断"过期"的规则只有一份，写在别处迟早会跟这里的 cutoff 走偏。
+// 删掉不影响当前这次合计 —— 过期条目本来就被 continue 跳过了，
+// 因此只是让 stats.json 不再无界增长（被删账号的残值会永远留在盘上）。
+func (r *Recorder) creditSumLocked(now time.Time) (remaining, total int64) {
+	cutoff := now.Add(-creditSampleTTL).Unix()
+	for id, c := range r.credits {
+		if c.AtUnix < cutoff {
+			delete(r.credits, id)
+			continue
+		}
+		remaining += c.Remaining
+		total += c.Total
+	}
+	return remaining, total
+}
+
+// setCreditsLocked 覆盖写"今天"与"当前小时"两个桶的余额字段，桶不存在则**新建**。
+//
+// 这里与「不新建」的直觉相反，是有意的：余额刷新与请求无关，只要服务在跑、
+// 账号是启用的就会周期性采样。若只在已有桶上写，**任何没有请求的日子
+// （周末、闲置）在积分曲线上就是一个洞** —— 而恰恰是那些日子最需要看清
+// 余额有没有被消耗。代价是极小的：这类桶的 Requests/Prompt 等流量字段全为 0，
+// 只让 covered_days 多算一天，不会污染任何用量口径。
+//
+// 两个桶（日桶的 Total 与小时桶）都要写：日粒度视图读 d.Total，今日视图读
+// d.ByHour[hKey]，只写一处会让另一个视图整条曲线没有余额。
+func (r *Recorder) setCreditsLocked(now time.Time, remaining, total int64) {
+	dKey, hKey := dayKey(now), hourKey(now)
+	d := r.days[dKey]
+	if d == nil {
+		d = &dayStat{}
+		r.days[dKey] = d
+	}
+	// 取局部变量再取地址：不能直接对参数取地址复用，否则两个桶（以及将来任何
+	// 再次赋值）会共享同一块内存，改一处等于改两处。
+	rem, tot := remaining, total
+	d.Total.Credits = &rem
+	d.Total.CreditsTotal = &tot
+
+	if d.ByHour == nil {
+		d.ByHour = map[string]*Bucket{}
+	}
+	hb := bucketOf(d.ByHour, hKey)
+	hrem, htot := remaining, total
+	hb.Credits = &hrem
+	hb.CreditsTotal = &htot
 }
 
 // ---------------------------------------------------------------------------

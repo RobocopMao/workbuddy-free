@@ -160,6 +160,9 @@ func main() {
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
+		// 余额刷新时顺手采一次积分水位进时间序列（菜单栏画积分趋势图的数据源）。
+		// 统计未启用时这里是 nil，调用点都有 nil 守卫。
+		Stats: statsRec,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:

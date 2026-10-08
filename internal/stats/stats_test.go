@@ -468,3 +468,292 @@ func TestEmptyReportHasAllTotalKeys(t *testing.T) {
 		t.Errorf("空区间汇总应全零: %+v", rep.Totals)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 积分（余额）采样
+// ---------------------------------------------------------------------------
+
+// creditOf 取出某个序列点上的 credits，并报告这个键在 JSON 里到底存不存在。
+// 直接读字段是分不开"没采到"与"采到 0"的（字段是指针，但 *p == 0 两种情况下
+// 都可能出现），所以走一遍 JSON：只有键真的出现过才算采到。
+func creditOf(t *testing.T, p Point) (float64, bool) {
+	t.Helper()
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal point: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal point: %v", err)
+	}
+	v, ok := m["credits"]
+	if !ok {
+		return 0, false
+	}
+	f, ok := v.(float64)
+	if !ok {
+		t.Fatalf("credits 不是 number: %T", v)
+	}
+	return f, true
+}
+
+// 余额是**覆盖写**：同一小时采三次只留最后一次，绝不能累加成三倍。
+func TestAddCreditsOverwritesNotAccumulates(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	r.recordAt(Sample{UID: "a", Model: "m", Delta: okDelta(1, 1, 2)}, at("2026-09-21 10:00"))
+	r.addCreditsAt("a", 500, 1000, at("2026-09-21 10:01"))
+	r.addCreditsAt("a", 600, 1000, at("2026-09-21 10:02"))
+	r.addCreditsAt("a", 550, 1000, at("2026-09-21 10:03"))
+
+	series := r.Report(RangeToday, at("2026-09-21 11:00")).Series
+	got, ok := creditOf(t, series[10])
+	if !ok {
+		t.Fatalf("当前小时点缺少 credits 字段")
+	}
+	if got != 550 {
+		t.Fatalf("credits = %v，期望 550（覆盖写取最后一次，累加会得到 1650）", got)
+	}
+}
+
+// 多账号求和：两个账号各采一次，桶里应是两者之和。
+func TestAddCreditsSumsAccounts(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	r.recordAt(Sample{UID: "a", Model: "m", Delta: okDelta(1, 1, 2)}, at("2026-09-21 10:00"))
+	r.addCreditsAt("a", 100, 1000, at("2026-09-21 10:01"))
+	r.addCreditsAt("b", 250, 1000, at("2026-09-21 10:02"))
+
+	series := r.Report(RangeToday, at("2026-09-21 11:00")).Series
+	got, ok := creditOf(t, series[10])
+	if !ok {
+		t.Fatalf("缺少 credits")
+	}
+	if got != 350 {
+		t.Fatalf("credits = %v，期望 350（100+250）", got)
+	}
+}
+
+// 某账号这一轮没采到（查询失败 / 账号临时不可用），它的最后一次已知值必须
+// **留在合计里**：摘掉的话曲线会凭空掉一块，而实际上什么都没发生。
+func TestAddCreditsKeepsLastKnownForSilentAccount(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	r.recordAt(Sample{UID: "a", Model: "m", Delta: okDelta(1, 1, 2)}, at("2026-09-21 10:00"))
+	r.addCreditsAt("a", 100, 1000, at("2026-09-21 10:01"))
+	r.addCreditsAt("b", 250, 1000, at("2026-09-21 10:02"))
+	// 这一轮只有 a 采到，b 缺席。
+	r.addCreditsAt("a", 90, 1000, at("2026-09-21 10:03"))
+
+	series := r.Report(RangeToday, at("2026-09-21 11:00")).Series
+	got, ok := creditOf(t, series[10])
+	if !ok {
+		t.Fatalf("缺少 credits")
+	}
+	if got != 340 {
+		t.Fatalf("credits = %v，期望 340（90 + b 的最后已知 250）", got)
+	}
+}
+
+// "没采到"必须与"余额为 0"可分辨：没有任何采样的时段不能长出 credits 键。
+//
+// 补 0 会被前端画成一条掉到地板的假线 —— 这正是用指针而不是 int64 的理由。
+func TestCreditsAbsentBeforeFirstSample(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	r.recordAt(Sample{UID: "a", Model: "m", Delta: okDelta(1, 1, 2)}, at("2026-09-21 10:00"))
+
+	series := r.Report(RangeToday, at("2026-09-21 11:00")).Series
+	if _, ok := creditOf(t, series[10]); ok {
+		t.Fatalf("未采样过余额，点里不该有 credits 键")
+	}
+}
+
+// 余额真的归零时**必须**留下 credits: 0，不能被 omitempty 吞掉。
+func TestCreditsZeroIsDistinctFromAbsent(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	r.recordAt(Sample{UID: "a", Model: "m", Delta: okDelta(1, 1, 2)}, at("2026-09-21 10:00"))
+	r.addCreditsAt("a", 0, 1000, at("2026-09-21 10:01"))
+
+	series := r.Report(RangeToday, at("2026-09-21 11:00")).Series
+	got, ok := creditOf(t, series[10])
+	if !ok {
+		t.Fatalf("余额为 0 时也要有 credits 键（用指针就是为了这个）")
+	}
+	if got != 0 {
+		t.Fatalf("credits = %v，期望 0", got)
+	}
+
+	// 落盘后再读回来，指针语义必须保持。
+	raw, err := json.Marshal(r.Report(RangeToday, at("2026-09-21 11:00")))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back struct {
+		Series []struct {
+			Credits *int64 `json:"credits"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	last := back.Series[10]
+	if last.Credits == nil {
+		t.Fatalf("序列化/反序列化后 credits 变成了 nil（0 被 omitempty 吞了）")
+	}
+	if *last.Credits != 0 {
+		t.Fatalf("反序列化后 credits = %v，期望 0", *last.Credits)
+	}
+}
+
+// 只有余额采样、当天没有任何请求的日子，也必须能画出点来。
+//
+// 周末 / 闲置的服务就是这个形态，而那正是最需要看清余额有没有被消耗的时候。
+func TestCreditsAreRecordedWithoutAnyRequest(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	r.addCreditsAt("a", 700, 1000, at("2026-09-21 10:00"))
+
+	series := r.Report(RangeToday, at("2026-09-21 11:00")).Series
+	got, ok := creditOf(t, series[10])
+	if !ok {
+		t.Fatalf("没有任何请求时也要有 credits（桶应由余额采样创建）")
+	}
+	if got != 700 {
+		t.Fatalf("credits = %v，期望 700", got)
+	}
+	// 流量字段不能因为这次采样被污染。
+	if reqs := series[10].Requests; reqs != 0 {
+		t.Fatalf("requests = %d，期望 0（余额采样不该增加请求数）", reqs)
+	}
+	// 日桶（按天视图读 d.Total）同样要带上余额，否则 7d/30d 视图整条线没有余额。
+	days := r.Report(Range7d, at("2026-09-21 11:00")).Series
+	lastDay := days[len(days)-1]
+	if got, ok := creditOf(t, lastDay); !ok || got != 700 {
+		t.Fatalf("日桶 credits = %v ok=%v，期望 700（两个粒度的桶都要写）", got, ok)
+	}
+}
+
+// 过期账号（超过 creditSampleTTL 没再采到）要从合计里剔除，且被真正删掉。
+func TestExpiredCreditAccountIsDropped(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	now := time.Now()
+	r.addCreditsAt("gone", 900, 1000, now)
+	r.addCreditsAt("live", 100, 1000, now)
+
+	// 手动把 gone 的时间戳拨到 TTL 之前，再采一次 live 触发求和。
+	r.mu.Lock()
+	c := r.credits["gone"]
+	c.AtUnix = now.Add(-creditSampleTTL - time.Hour).Unix()
+	r.credits["gone"] = c
+	r.mu.Unlock()
+
+	r.addCreditsAt("live", 90, 1000, now)
+	// 断言要在锁内读：外部测试直接摸 r.credits，不持锁会与 flusher/采样竞争。
+	r.mu.Lock()
+	_, stillThere := r.credits["gone"]
+	sum, _ := r.creditSumLocked(now)
+	r.mu.Unlock()
+	if stillThere {
+		t.Fatalf("过期账号没有被删掉，stats.json 会无界增长")
+	}
+	if sum != 90 {
+		t.Fatalf("合计 = %v，期望 90（只剩 live）", sum)
+	}
+}
+
+// 余额字段必须真的落盘（走既有的 dirty/flusher 机制）、并能从盘上读回来。
+func TestCreditsSurviveReload(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "stats.json")
+	r := New(fp, 30)
+	r.recordAt(Sample{UID: "a", Model: "m", Delta: okDelta(1, 1, 2)}, at("2026-09-21 10:00"))
+	r.addCreditsAt("a", 420, 1000, at("2026-09-21 10:01"))
+	r.Flush()
+	r.Close()
+
+	if _, err := os.Stat(fp); err != nil {
+		t.Fatalf("落盘文件不存在: %v", err)
+	}
+	r2 := New(fp, 30)
+	defer r2.Close()
+	series := r2.Report(RangeToday, at("2026-09-21 11:00")).Series
+	got, ok := creditOf(t, series[10])
+	if !ok {
+		t.Fatalf("重新打开后 credits 丢了")
+	}
+	if got != 420 {
+		t.Fatalf("重新打开后 credits = %v，期望 420", got)
+	}
+}
+
+// 老文件（本次改动之前落盘的、没有 credits_accounts 键）必须能正常读，
+// 且历史桶不能被凭空写上 credits。
+func TestOpenLegacyFileWithoutCredits(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "stats.json")
+	old := `{"days":{"2026-10-01":{"total":{"requests":3,"failed":1,"prompt_tokens":10,"completion_tokens":5}}},` +
+		`"lifetime":{"requests":3},"since":"2026-10-01"}`
+	if err := os.WriteFile(fp, []byte(old), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	r := New(fp, 30)
+	defer r.Close()
+	if r.credits == nil {
+		t.Fatalf("credits 未初始化，AddCredits 会 panic")
+	}
+	// 老桶没有 credits，序列化时不能凭空长出 0。
+	rep := r.Report(Range30d, at("2026-10-02 12:00"))
+	for _, p := range rep.Series {
+		if _, ok := creditOf(t, p); ok {
+			t.Fatalf("老桶 %v 不该有 credits 键", p.Key)
+		}
+	}
+	// 采一次之后只影响当前桶。
+	r.addCreditsAt("a", 5, 10, at("2026-10-02 12:00"))
+	raw, err := json.Marshal(r.days)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	legacy, ok := back["2026-10-01"].(map[string]any)
+	if !ok {
+		t.Fatalf("老桶丢了")
+	}
+	total, ok := legacy["total"].(map[string]any)
+	if !ok {
+		t.Fatalf("老桶的 total 丢了")
+	}
+	if _, exists := total["credits"]; exists {
+		t.Fatalf("老桶被写上了 credits，历史数据不该被污染")
+	}
+	// 老文件不该被写上 credits_accounts 之外的怪东西，且新观测确实落到了新桶。
+	cur, ok := back["2026-10-02"].(map[string]any)
+	if !ok {
+		t.Fatalf("新桶没建出来（余额采样必须能新建桶）")
+	}
+	curTotal, ok := cur["total"].(map[string]any)
+	if !ok {
+		t.Fatalf("新桶的 total 丢了")
+	}
+	if _, exists := curTotal["credits"]; !exists {
+		t.Fatalf("新桶应有 credits")
+	}
+}
+
+// 空 accountID 的观测必须被丢弃：否则所有取不到账号标识的采样会混成一个假账号，
+// 在合计里虚增一份永远不回落的水位。
+func TestAddCreditsIgnoresEmptyAccount(t *testing.T) {
+	r := New("", 30)
+	defer r.Close()
+	r.addCreditsAt("", 500, 1000, at("2026-09-21 10:00"))
+	r.mu.Lock()
+	n := len(r.credits)
+	r.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("空 accountID 应被丢弃，credits 表里有 %d 条", n)
+	}
+}

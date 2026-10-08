@@ -13,6 +13,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stats"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -46,6 +47,11 @@ type Config struct {
 	KeepaliveDisabled bool
 	// BlackcatDisabled 显式关闭夜猫子排程（schedule.blackcat_enabled=false）。
 	BlackcatDisabled bool
+
+	// Stats 用量统计记录器（可选，nil = 统计未启用）。余额刷新时顺手采一次
+	// 「积分水位」进时间序列，菜单栏据此画积分趋势图。**所有调用点都必须有 nil
+	// 守卫**：config 里 stats.enabled=false 时 main 传进来的就是 nil。
+	Stats *stats.Recorder
 }
 
 // Scheduler 调度器。
@@ -405,6 +411,13 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
 			} else {
 				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			}
+			// 顺手采一次积分水位：这是全流程里**唯一**天然高频的余额观测点
+			// （后台周期 + 面板手动全量刷新都走这里），菜单栏的积分趋势图全靠它。
+			// 传参顺序是 (剩余, 总额)：workbuddy 的 credits 语义 = 剩余。
+			// Stats 为 nil（stats.enabled=false）时必须跳过，否则空指针崩溃。
+			if s.cfg.Stats != nil {
+				s.cfg.Stats.AddCredits(uid, remain, total)
 			}
 		}(a, st.UID)
 	}

@@ -30,6 +30,11 @@ type statsFile struct {
 	// 落盘文件要给人看，[{} {} {}] 这种 set 序列化形态没法读。
 	Since string   `json:"since,omitempty"`
 	UIDs  []string `json:"uids,omitempty"`
+	// CreditsAccounts 各账号的最后一次余额观测（7 天保质期，见 creditSampleTTL）。
+	// 与 Days 分开存：余额合计要跨账号求和、且口径是"最近 7 天内观测到的号"，
+	// 与某个日桶无关。omitempty 让未启用/从未采样过的文件不长出这个键
+	// （老文件读进来也是 nil，addCreditsAt 里有 nil 守卫）。
+	CreditsAccounts map[string]creditAccount `json:"credits_accounts,omitempty"`
 }
 
 // load 载入已存在的统计文件（不存在视为首次运行）。
@@ -60,6 +65,11 @@ func (r *Recorder) load() {
 	r.days = sf.Days
 	r.life = sf.Lifetime
 	r.since = sf.Since
+	// 老文件（本次改动之前落盘的）没有 credits_accounts 键，解析出来是 nil；
+	// AddCredits 里有 nil 守卫重建，这里不必补，但显式记一句免得后来者以为漏了。
+	if sf.CreditsAccounts != nil {
+		r.credits = sf.CreditsAccounts
+	}
 	for _, u := range sf.UIDs {
 		r.uids[u] = struct{}{}
 	}
@@ -110,10 +120,11 @@ func (r *Recorder) saveLocked() {
 	}
 	sort.Strings(uids) // 稳定顺序：同一份状态每次落盘的字节一致，便于 diff 与备份比对
 	raw, err := json.MarshalIndent(statsFile{
-		Days:     r.days,
-		Lifetime: r.life,
-		Since:    r.since,
-		UIDs:     uids,
+		Days:            r.days,
+		Lifetime:        r.life,
+		Since:           r.since,
+		UIDs:            uids,
+		CreditsAccounts: r.credits,
 	}, "", "  ")
 	if err != nil {
 		r.notePersistFail(err)

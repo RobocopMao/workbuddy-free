@@ -271,6 +271,12 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
 		remain, total = rm, tt
 		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
+		// 新号的第一个观测点就在登录这一刻：不采的话，积分曲线要等到下一个
+		// 余额刷新周期才有第一个点，刚加完号的用户会看到一条凭空开始的线。
+		// Stats 为 nil（未启用统计）时跳过。
+		if p.cfg.Stats != nil {
+			p.cfg.Stats.AddCredits(acct.UID, rm, tt)
+		}
 	}
 
 	p.loginMu.Lock()

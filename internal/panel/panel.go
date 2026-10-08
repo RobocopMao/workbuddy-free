@@ -313,6 +313,12 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
+	// 手动签到也是一次余额观测，顺手采样：否则用户点完签到还要等下一个后台周期
+	// 才能在积分曲线上看到那个台阶，观感上像"点了没反应"。
+	// 传参顺序 (剩余, 总额)；Stats 为 nil（未启用统计）时跳过。
+	if p.cfg.Stats != nil {
+		p.cfg.Stats.AddCredits(uid, remain, total)
+	}
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
@@ -333,6 +339,11 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.SetCredits(uid, remain, total)
+	// 同上：面板上点「刷新余额」是用户主动要看余额变化，这一刻的观测必须立刻进曲线，
+	// 不然用户会以为采样坏了（曲线要等后台周期才动）。
+	if p.cfg.Stats != nil {
+		p.cfg.Stats.AddCredits(uid, remain, total)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 

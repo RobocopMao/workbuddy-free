@@ -13,6 +13,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stats"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -404,5 +405,54 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	// 禁用账号不参与：其 credits 保持 0（未被 UserResource 覆盖解冻）。
 	if st2, _ := p.Status("u2"); !st2.Disabled {
 		t.Errorf("u2 must stay disabled")
+	}
+}
+
+// 余额刷新要顺手把「积分水位」采进统计：这是菜单栏积分趋势图唯一的高频数据源，
+// 接线断了图就是一条空线，而单测各包都绿（stats 自己测自己、scheduler 不查 Stats）。
+func TestRunBalanceRefreshNowSamplesCreditsIntoStats(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 4321}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	rec := stats.New("", 30)
+	defer rec.Close()
+	s := New(Config{Pool: p, Upstream: up, Stats: rec})
+	s.RunBalanceRefreshNow()
+
+	rep := rec.Report(stats.RangeToday, time.Now())
+	var found bool
+	for _, pt := range rep.Series {
+		if pt.Credits == nil {
+			continue
+		}
+		found = true
+		if *pt.Credits != 4321 {
+			t.Errorf("credits=%d want 4321", *pt.Credits)
+		}
+	}
+	if !found {
+		t.Fatalf("余额刷新没有把积分采进统计（Stats 接线断了）")
+	}
+}
+
+// Stats 为 nil（config 里 stats.enabled=false）时余额刷新照常工作、不 panic。
+func TestRunBalanceRefreshNowWithoutStats(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 777}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up}) // Stats 留空
+	s.RunBalanceRefreshNow()
+
+	if st, _ := p.Status("u1"); st.Credits != 777 {
+		t.Errorf("credits=%d want 777（nil Stats 不该影响余额刷新）", st.Credits)
 	}
 }
