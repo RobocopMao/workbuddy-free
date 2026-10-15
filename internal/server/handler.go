@@ -62,6 +62,12 @@ type Config struct {
 
 	// Stats 时间序列用量统计（可选；nil = 只累计到 pool 的账号级总量，不出按天/按模型报表）。
 	Stats *stats.Recorder
+
+	// CORS 跨域放行的静态兜底值（Live 为 nil 时生效；正常装配走 livecfg 快照，
+	// 面板在线改完立即生效）。详见 cors.go 与 cmd/server 的 cors 配置块。
+	CORSEnabled          bool
+	CORSOrigins          []string
+	CORSAllowCredentials bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -70,8 +76,11 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:       h.cfg.APIKey,
-		SoftCooldown: h.cfg.SoftCooldown,
+		APIKey:               h.cfg.APIKey,
+		SoftCooldown:         h.cfg.SoftCooldown,
+		CORSEnabled:          h.cfg.CORSEnabled,
+		CORSOrigins:          h.cfg.CORSOrigins,
+		CORSAllowCredentials: h.cfg.CORSAllowCredentials,
 	}
 }
 
@@ -136,6 +145,12 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// CORS 在进路由之前处理：预检请求（OPTIONS + Access-Control-Request-Method）
+	// 由中间件就地应答——ServeMux 没注册 OPTIONS，落下去就是 405，浏览器只会报
+	// 含糊的 "Load failed"。未启用/未放行时本函数零副作用（详见 cors.go）。
+	if h.applyCORS(w, r) {
+		return
+	}
 	h.mux.ServeHTTP(w, r)
 }
 

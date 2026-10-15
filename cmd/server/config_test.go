@@ -825,3 +825,94 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
 	}
 }
+
+// TestCORSDefaults CORS 默认关闭（保持既有"纯本地/反代"边界，零行为变化）。
+func TestCORSDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.CORS.Enabled {
+		t.Error("cors.enabled 默认应为 false")
+	}
+	// origins 为空 → 运行时回落到内置本机清单（不在配置里塞默认值，
+	// 这样面板上"留空 = 用内置本机清单"的语义在回显时一眼可见）。
+	if len(c.CORS.Origins) != 0 {
+		t.Errorf("cors.origins 默认为空，得到 %v", c.CORS.Origins)
+	}
+	if c.CORS.AllowCredentials {
+		t.Error("cors.allow_credentials 默认应为 false")
+	}
+}
+
+// TestCORSParsedAndNormalized origins 逐项归一化：去空白、转小写、去尾斜杠、去重语义不受影响。
+func TestCORSParsedAndNormalized(t *testing.T) {
+	c, err := ParseConfig([]byte(`{
+		"cors": {
+			"enabled": true,
+			"allow_credentials": true,
+			"origins": ["  HTTP://LocalHost:5173/  ", "app://My-Editor", "tauri://localhost"]
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"http://localhost:5173", "app://my-editor", "tauri://localhost"}
+	if len(c.CORS.Origins) != len(want) {
+		t.Fatalf("origins=%v want %v", c.CORS.Origins, want)
+	}
+	for i := range want {
+		if c.CORS.Origins[i] != want[i] {
+			t.Errorf("origins[%d]=%q want %q", i, c.CORS.Origins[i], want[i])
+		}
+	}
+	if !c.CORS.Enabled || !c.CORS.AllowCredentials {
+		t.Errorf("开关未解析：%+v", c.CORS)
+	}
+}
+
+// TestCORSWildcardWithCredentialsRejected "*" + allow_credentials 是浏览器明令禁止的组合，
+// 必须 fail fast（否则运行时表现为"凭据请求被静默拒绝"，极难排查）。
+func TestCORSWildcardWithCredentialsRejected(t *testing.T) {
+	_, err := ParseConfig([]byte(`{"cors":{"enabled":true,"allow_credentials":true,"origins":["*"]}}`))
+	if err == nil {
+		t.Fatal("want error for {\"*\"} + allow_credentials")
+	}
+	if !strings.Contains(err.Error(), "allow_credentials") {
+		t.Errorf("err=%v 应点明 allow_credentials", err)
+	}
+}
+
+// TestCORSWildcardAloneAllowed 只配 "*"（不带凭据）合法，且归一化成单元素列表。
+func TestCORSWildcardAloneAllowed(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"cors":{"enabled":true,"origins":["*","http://x"]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.CORS.Origins) != 1 || c.CORS.Origins[0] != "*" {
+		t.Errorf("origins=%v want [*]（通配时其余项无意义）", c.CORS.Origins)
+	}
+}
+
+// TestCORSEmptyOriginRejected origins 里的空串多半是手滑多了个逗号，报错而不是静默丢弃。
+func TestCORSEmptyOriginRejected(t *testing.T) {
+	_, err := ParseConfig([]byte(`{"cors":{"enabled":true,"origins":["http://localhost:5173",""]}}`))
+	if err == nil {
+		t.Fatal("want error for empty origin")
+	}
+	if !strings.Contains(err.Error(), "cors.origins[1]") {
+		t.Errorf("err=%v 应指出出错下标", err)
+	}
+}
+
+// TestCORSDisallowedOriginsNotValidatedWhenDisabled 关闭状态下不校验清单内容之外的语义
+// （关着就是关着：* 与凭据的组合在未启用时不该拦住启动）。
+func TestCORSDisallowedOriginsNotValidatedWhenDisabled(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"cors":{"enabled":false,"allow_credentials":true,"origins":["*"]}}`))
+	if err != nil {
+		t.Fatalf("未启用时不该报错：%v", err)
+	}
+	if c.CORS.Enabled {
+		t.Error("enabled 应为 false")
+	}
+}

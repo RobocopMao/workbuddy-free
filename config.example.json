@@ -6,6 +6,11 @@
   "server": {
     "max_body_mb": 8
   },
+  "cors": {
+    "enabled": false,
+    "allow_credentials": false,
+    "origins": []
+  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"

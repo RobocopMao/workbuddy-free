@@ -760,6 +760,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
             </div>
+            <div class="hr"></div>
+            <div class="switch"><span class="lb">浏览器跨域（CORS）</span>
+              <input type="checkbox" name="cors_enabled"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">放行来源</span>
+                <input name="cors_origins" placeholder="留空 = 仅本机来源">
+                <span class="hint">逗号分隔，需带协议与端口；<code>*</code> = 放行任意来源（慎用）</span></label>
+              <label class="fld"><span class="lb">允许携带凭据</span>
+                <div class="switch"><span class="lb">回显 Allow-Credentials</span>
+                  <input type="checkbox" name="cors_allow_credentials"></div>
+                <span class="hint">与 <code>*</code> 互斥；仅在使用 Cookie 时开启</span></label>
+            </div>
+            <div class="hint" style="margin-top:2px">开启后浏览器里的页面（本机前端、Vite dev server）可直接调 <code>/v1</code>；留空则只放行 localhost / 127.0.0.1 等本机来源。改动立即生效。</div>
           </div>
         </div>
 

@@ -18,6 +18,14 @@ type Snapshot struct {
 	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	// CORSEnabled / CORSOrigins：浏览器跨域放行（面板改完立即生效，无需重启）。
+	// CORSOrigins 按约定是**只读**切片：Store 之后任何人不原地修改它
+	// （快照按值拷贝但底层数组共享；要改就再 Store 一份新切片）。
+	CORSEnabled bool
+	CORSOrigins []string
+	// CORSAllowCredentials 是否回显 Access-Control-Allow-Credentials: true
+	// （与 origins 里的 "*" 互斥，config 校验期已拦截该组合）。
+	CORSAllowCredentials bool
 }
 
 // Holder 原子持有当前快照。

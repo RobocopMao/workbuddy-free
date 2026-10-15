@@ -382,6 +382,9 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.max_body_mb` | `8` | 聊天请求体大小上限（MB）。超限直接返回 **413 `request_body_too_large`** |
+| `cors.enabled` | `false` | 是否放行**浏览器跨域**直连 `/v1`（本地前端 / Vite dev server / Tauri WebView）。见下方「浏览器跨域」 |
+| `cors.origins` | 空 | 放行来源清单（逗号分隔的 JSON 数组）；**空 = 只放行本机来源**；`["*"]` = 放行任意来源（慎用） |
+| `cors.allow_credentials` | `false` | 是否回显 `Access-Control-Allow-Credentials`；与 `origins` 里的 `"*"` **互斥** |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 签到 + 余额查询解冻时点 |
@@ -404,6 +407,54 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 | `pool.idle_weight_per_hour` | `0.5` | 闲置补偿：每小时未使用 +0.5 权重 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
+
+### 浏览器跨域（CORS）
+
+**默认关闭**：网关原本只服务非浏览器调用方（curl / 各类客户端 / 上游 Agent），不发任何
+`Access-Control-Allow-*` 头。要把 `/v1` 直接给**浏览器里的页面**用（本地 Tauri / WebView
+前端、Vite dev server 里的页面、自建网页工具）时打开它——否则浏览器会先发 `OPTIONS`
+预检，而该路由没注册 OPTIONS，返回 405 且无 CORS 头，前端只能看到含糊的
+`TypeError: Load failed` / `Failed to fetch`。注意 CORS 是**浏览器侧**策略，curl、Node、
+Go 客户端都不执行，所以此前一直不暴露。
+
+```jsonc
+"cors": {
+  "enabled": true,        // 默认 false
+  "allow_credentials": false,
+  "origins": []           // 空 = 只放行本机来源
+}
+```
+
+**`origins` 留空时的内置本机来源清单**（`*` 只出现在端口位，主机名/协议写死）：
+
+```
+http://localhost:*      https://localhost:*      http://localhost      https://localhost
+http://127.0.0.1:*      https://127.0.0.1:*      http://127.0.0.1      https://127.0.0.1
+http://[::1]:*          https://[::1]:*          http://[::1]          https://[::1]
+tauri://localhost       http://tauri.localhost   https://tauri.localhost
+```
+
+覆盖了 Vite dev server（`http://localhost:5173`）与 Tauri v2 打包后的 WebView 来源
+（macOS/Linux 是 `tauri://localhost`，Windows/Android 是 `http(s)://tauri.localhost`）。
+默认端口下浏览器发出的 Origin **不带**端口号，所以不带端口的形态也一并列出。
+
+| 配置 | 行为 |
+|---|---|
+| `enabled: false` | 零行为变化：预检答 403（带提示），响应无任何 CORS 头，裸 `OPTIONS` 仍是 405 |
+| `enabled: true` + `origins: []` | 放行上面那份本机清单；公网来源预检 403 |
+| `enabled: true` + 具体清单 | 逐项匹配（大小写不敏感、忽略尾斜杠、支持 `*` 通配，如 `http://*.example.com:*`） |
+| `enabled: true` + `["*"]` | 放行任意来源。ACAO 回字面量 `*`，**不能**与 `allow_credentials` 同开（配了直接报错），等于把网关密钥暴露给任意网页，**仅限完全信任的本机环境** |
+
+其它行为细节：
+
+- **来源未放行时，普通请求仍照常透传**（只是不加 CORS 头，由浏览器自行拦截），
+  以免误伤偶尔带 `Origin` 头的非浏览器调用方；只有**预检**会被答 403。
+- 鉴权失败（401）等错误响应**同样带 CORS 头**，否则浏览器里读不到"密钥不对"这类关键信息。
+- 回显具体来源时附带 `Vary: Origin`（防中间缓存串站）；`Access-Control-Allow-Headers`
+  回显客户端声明的清单（只在校验通过时回显，防响应头注入）。
+- 支持 Chrome 的 Private Network Access：预检带 `Access-Control-Request-Private-Network: true`
+  时回 `Access-Control-Allow-Private-Network: true`。
+- **改动立即生效**（`cors.*` 在管理面板「配置」页里改完即生效，无需重启进程）。
 
 ### 上游超时语义
 
@@ -515,6 +566,9 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 
 > **鉴权规则**：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 
+> **跨域**：默认不发 CORS 头（非浏览器调用方不受影响）。浏览器页面直连时打开
+> `cors.enabled`——预检 `OPTIONS` 会就地答 204 并带放行头，详见「[浏览器跨域（CORS）](#浏览器跨域cors)」。
+
 ### 流式行为细节
 
 - 出站请求强制 `stream:true`；SSE 帧按 OpenAI 规范**白名单重建**（`reasoning_content` 保留、工具调用按 index 合并、未知字段剥离）
@@ -558,7 +612,7 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
   `TTFB` 是流式首帧耗时（非流式为 `-`）。**TTFB 高说明上游出字慢，tok/s 低说明生成慢**，据此可快速判断瓶颈在哪。
 - **任务队列**：点「扫描待办」拉取所有账号未完成的任务并排成一列，「执行全部待办」按账号串行执行，账号间可选并发 1-3，进度实时回填。
 
-**配置热生效**：保存后 `api_key`、`cooldown.soft_rate`、脱敏开关、`pool.*`、`schedule.*` **立即生效**；涉及进程装配期的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）会提示「需重启进程生效」。写入采用「深合并且原子替换」，只更新表单覆盖的键，手写的未知键原样保留。
+**配置热生效**：保存后 `api_key`、`cooldown.soft_rate`、脱敏开关、`pool.*`、`schedule.*`、`cors.*` **立即生效**；涉及进程装配期的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）会提示「需重启进程生效」。写入采用「深合并且原子替换」，只更新表单覆盖的键，手写的未知键原样保留。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`、脚本仅同源、`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`。前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
@@ -649,6 +703,14 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 1. **Base URL 少了 `/v1`** —— 网关的路径是 `/v1/chat/completions`，Base URL 应填 `http://<host>:7863/v1`
 2. **协议不匹配** —— 本网关只实现 OpenAI 的 `chat/completions`。Claude Code 的 Anthropic 协议（`/v1/messages`）与 Codex 默认的 Responses 协议（`/v1/responses`）都是 **404**；Codex 需把 provider 的 `wire_api` 设为 `chat`
 3. **模型名不属于该域** —— 见上一条
+
+### 网页里调 `/v1` 报 `Load failed` / `Failed to fetch`？
+
+CORS 没开。浏览器会先发 `OPTIONS` 预检，未启用跨域时该请求被拒（响应里没有任何
+`Access-Control-Allow-*` 头），前端只能看到含糊的网络错误——而 curl / Node 客户端
+一切正常，容易误判成"接口挂了"。打开 `cors.enabled`（管理面板「配置」页有开关，
+**改完立即生效，无需重启**）即可；默认只放行本机来源，公网页面仍需显式加进
+`cors.origins`。详见上方「[浏览器跨域（CORS）](#浏览器跨域cors)」。
 
 ### 429 code=6004（模型级限流）的冷却语义？
 

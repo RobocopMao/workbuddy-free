@@ -736,6 +736,8 @@ const CFG_MAP = {
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   stats_enabled: ['stats', 'enabled'], stats_keep_days: ['stats', 'keep_days'],
+  cors_enabled: ['cors', 'enabled'], cors_origins: ['cors', 'origins'],
+  cors_allow_credentials: ['cors', 'allow_credentials'],
 };
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -773,6 +775,8 @@ function collectConfig() {
       const raw = el.value.trim();
       if (raw === '') v = undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
+      // 来源清单：逗号/中文逗号/空白分隔；留空 = 用内置本机来源清单。
+      else if (name === 'cors_origins') v = raw.split(/[,，\s]+/).filter(Boolean);
       else v = raw;
     }
     if (v !== undefined) put(out, path, v);

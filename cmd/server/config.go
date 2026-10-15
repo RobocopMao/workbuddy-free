@@ -160,6 +160,32 @@ type Config struct {
 		File string `json:"file"`
 	} `json:"stats"`
 
+	// CORS 浏览器跨域放行（默认关闭，保持既有"纯本地/反代"安全边界）。
+	//
+	// 背景：本网关是纯 Go 服务、无任何浏览器侧调用方时不需要 CORS 头；但一旦要把
+	// /v1 直接暴露给**浏览器里的页面**（Tauri/WebView 前端、本地 Vite dev server、
+	// 自建网页工具），浏览器就会先发 OPTIONS 预检——ServeMux 对未注册 OPTIONS 的
+	// 路由直接 405，且响应无 Access-Control-Allow-* 头，请求一律被拦成
+	// "TypeError: Load failed"。开关打开后由中间件统一应答预检并补响应头。
+	//
+	// 安全取舍：默认 enabled=false（零行为变化）；打开后默认只放行**本机来源**
+	// （localhost / 127.0.0.1 / tauri://localhost 等，见 server.defaultLocalOriginPatterns），
+	// 公网页面仍被拦。origins 里的 "*" 表示放行任意来源——此时浏览器会拒绝携带
+	// Authorization 的凭据请求语义，且等于把网关密钥暴露给任意网页，**仅在完全信任的
+	// 本机环境使用**。
+	CORS struct {
+		// Enabled 是否启用跨域放行（默认 false）。
+		Enabled bool `json:"enabled"`
+		// AllowCredentials 是否回显 Access-Control-Allow-Credentials: true。
+		// 与 origins 里的 "*" 互斥（浏览器的 CORS 规范禁止二者共存），
+		// 同时配置时 normalize 直接报错，不静默丢弃。
+		AllowCredentials bool `json:"allow_credentials"`
+		// Origins 放行来源清单，逐项精确匹配（支持 "*" 通配与带端口的 host）。
+		// 空 = 用内置的本机来源清单（localhost / 127.0.0.1 / [::1] / tauri://localhost，
+		// 任意端口）。
+		Origins []string `json:"origins"`
+	} `json:"cors"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -217,6 +243,10 @@ func Default() *Config {
 	c.SessionSticky.GCInterval = "5m"
 	c.Stats.Enabled = true
 	c.Stats.KeepDays = 30
+	// CORS 默认关闭：纯本地/反代用法零行为变化；要用浏览器直连时在面板里打开。
+	c.CORS.Enabled = false
+	c.CORS.AllowCredentials = false
+	c.CORS.Origins = nil // 空 = 启用后回落到内置本机来源清单（见 normalizeCORS）
 	return c
 }
 
@@ -473,7 +503,52 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
+	if err := c.normalizeCORS(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
+}
+
+// normalizeCORS 规整并校验 cors 配置块。
+//
+// 校验风格与其它字段一致：**配置矛盾直接 fail fast**，不静默"修正"——
+// 静默丢弃用户写的 origins 会让人以为跨域已放行，实际浏览器仍在拦。
+//
+//   - origins 逐项去空白/转小写/去尾斜杠（用户常粘贴带尾斜杠的地址，
+//     而浏览器发出的 Origin 没有尾斜杠）；空项直接报错（多半是手滑多了个逗号）。
+//   - origins 里含 "*" 表示放行任意来源：这是唯一会同时放宽公网页面的取值，
+//     与 allow_credentials=true 组合被浏览器规范禁止，故在此直接报错。
+//   - 未启用时不校验 origins 合法性之外的内容（关着就是关着，配了也不生效）。
+func (c *Config) normalizeCORS() error {
+	out := make([]string, 0, len(c.CORS.Origins))
+	for i, raw := range c.CORS.Origins {
+		v := strings.TrimRight(strings.ToLower(strings.TrimSpace(raw)), "/")
+		if v == "" {
+			return fmt.Errorf("cors.origins[%d]: 空来源（多余的逗号或空串），请删掉或填入形如 http://localhost:5173 的来源", i)
+		}
+		out = append(out, v)
+	}
+	c.CORS.Origins = out
+
+	hasWildcard := false
+	for _, v := range out {
+		if v == "*" {
+			hasWildcard = true
+			break
+		}
+	}
+	if hasWildcard {
+		// 只保留一个 "*"，避免逐项匹配时走无谓的循环。
+		c.CORS.Origins = []string{"*"}
+	}
+	// 互斥组合只在**启用时**才算配置矛盾：关着的时候整块配置是惰性的，
+	// 为它拦住启动（或让面板保存报错）只会让人困惑——等真正打开时再报错，
+	// 那时错误信息才有落点。
+	if c.CORS.Enabled && hasWildcard && c.CORS.AllowCredentials {
+		return fmt.Errorf("cors: origins 含 \"*\"（放行任意来源）时不能同时开启 allow_credentials" +
+			"（浏览器 CORS 规范禁止，凭据请求会被直接拒绝）；请改用具体来源清单")
+	}
+	return nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom 模式）。

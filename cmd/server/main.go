@@ -202,11 +202,14 @@ func main() {
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
-	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	// live 承载可热改字段（api_key/soft_rate/脱敏开关/跨域放行），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		CORSEnabled:          cfg.CORS.Enabled,
+		CORSOrigins:          cfg.CORS.Origins,
+		CORSAllowCredentials: cfg.CORS.AllowCredentials,
 	})
 	pn := panel.New(panel.Config{
 		Pool:        p,
@@ -246,6 +249,10 @@ func main() {
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		// CORS 静态兜底（Live 为 nil 时生效；正常装配下走 live 快照，面板改完立即生效）。
+		CORSEnabled:          cfg.CORS.Enabled,
+		CORSOrigins:          cfg.CORS.Origins,
+		CORSAllowCredentials: cfg.CORS.AllowCredentials,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -343,6 +350,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		CORSEnabled:          newCfg.CORS.Enabled,
+		CORSOrigins:          newCfg.CORS.Origins,
+		CORSAllowCredentials: newCfg.CORS.AllowCredentials,
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
